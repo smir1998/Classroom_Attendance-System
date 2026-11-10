@@ -1,53 +1,51 @@
 # Classroom Attendance Studio
 
-A local desktop attendance prototype for webcam sessions and group photographs. OpenCV YuNet detects multiple faces, SFace converts each aligned face crop into a numerical embedding, and cosine similarity compares it with each enrolled student's average embedding. The app draws a box and name or **Unknown** with a similarity score, marks identified students present once per day, and exports the class report as CSV or Excel. Camera frames and face images are processed locally.
+A local desktop attendance prototype for webcam sessions and group photographs. OpenCV YuNet detects faces; SFace converts each aligned crop to a numerical embedding. The student dataset is used to build identity profiles, compare group-photo embeddings, mark daily attendance, and export CSV or Excel reports.
 
 ## Run on Windows
 
 1. Install Python 3.10 or newer with Tcl/Tk.
-2. Open PowerShell in this folder and install packages:
+2. Open PowerShell in this folder and install dependencies:
 
    ```powershell
    python -m pip install -r requirements.txt
    ```
 
-3. Download the YuNet detector and SFace embedding model from the [OpenCV Zoo](https://github.com/opencv/opencv_zoo):
+3. Download the YuNet and SFace model files from the [OpenCV Zoo](https://github.com/opencv/opencv_zoo):
 
    ```powershell
    python download_models.py
    ```
 
-   This step needs internet access once. The model files are saved under `models/` and are excluded from Git.
+   This requires internet access once. Model files are saved in `models/` and excluded from Git.
 
-4. Launch the application:
+4. Start the app:
 
    ```powershell
    python app.py
    ```
 
-## Enroll and build the face dataset
+## Build the student dataset
 
-1. Open **Students & face dataset** and choose **Add student**.
-2. Enter a unique student ID and name. The camera captures 24 aligned face crops while one face is visible.
-3. For existing photos, select that student in the roster and choose **Import photos**. Each imported photo must contain exactly one detectable face.
-4. The inspectable face crops are saved to `data/dataset/<internal-student-id>/`. Choose **Train embeddings** after adding or changing dataset images. The app makes one average embedding per student in memory.
+1. Open **Students & face dataset** and choose **Add student** to capture 24 aligned images, or select a student and choose **Import photos**.
+2. For imported photos, use one clear face per image. Group photos are for attendance scans; do not use them as training images because face-to-student labels would be ambiguous.
+3. Review images in `data/dataset/<internal-student-id>/`. Capture varied, clear samples under normal lighting and pose.
+4. Choose **Train embeddings**. The app runs quality checks, applies horizontal-flip and mild lighting augmentation, removes embedding outliers, and builds up to three pose/appearance prototypes per student. It validates profiles with leave-one-out comparisons and, when there are enough impostor comparisons, calibrates the threshold toward an empirical false-accept rate of at most 1%. The training report shows the observed rates and fallback when the dataset cannot meet that target.
+5. Open **Training report** to review how many images were used or filtered and the validation scores. The trained profiles are cached locally in `data/student_profiles.npz`; the app reuses the cache when the dataset is unchanged and retrains after dataset changes.
 
-Use multiple clear samples for each student with varied but normal head pose and lighting. Do not train using group photos as identity examples; enroll one student per sample so the label is unambiguous.
+SFace's pretrained neural network is not fine-tuned. Student-specific profiles are learned from its embeddings, a more practical approach for classroom-sized datasets. The validation figures are estimates from the enrolled images and do not guarantee performance on future photos; collect separate evaluation images for a reliable deployment assessment.
 
 ## Take attendance
 
 - **Start camera** scans the live webcam feed.
-- **Open group photo** scans a JPG, PNG, BMP, or WebP photograph. It draws a box around every detected face, lists each match and similarity, then marks recognized students present. Unknown faces are shown for review and are not added to attendance.
-- **Mark present** provides a manual option for a selected student.
-- A recognized student is recorded once per local calendar day. Each record stores a date and local timestamp.
-- **Export CSV** and **Export Excel** save all roster students, including absent students, and their attendance timestamp for today.
+- **Open group photo** scans a JPG, PNG, BMP, or WebP image, draws a box and match score around each detected face, and lists a match or **Unknown** for review.
+- A recognized student is recorded once per local calendar day with a timestamp. Unknown faces are not marked present.
+- **Mark present** provides a manual alternative. **Export CSV** and **Export Excel** include every roster student and their present/absent status and timestamp for today.
 
-Cosine similarity is shown as a score from approximately `0.0` to `1.0`; it is not a probability or confidence percentage. `MATCH_THRESHOLD` in `app.py` defaults to `0.363`. Tune it using consented samples from the actual camera and review false matches before use. Group photographs with small, blurry, occluded, or turned-away faces can be missed or mismatched; have a teacher review results and correct attendance.
-
-The default camera index is `0`; change `CAMERA_INDEX` in `app.py` if necessary.
+The displayed cosine similarity is a score from around `0.0` to `1.0`, not a probability. Group photos with small, blurry, occluded, or turned-away faces can be missed or mismatched. A teacher should review results and correct attendance.
 
 ## Local data and privacy
 
-`data/attendance.sqlite3` stores the roster and attendance history. Face crops are in `data/dataset/`. These files are not encrypted; restrict access to the computer account and folder. **Remove** deletes a student's crops and attendance history. After roster or dataset changes, choose **Train embeddings** before the next scan. To erase app data, close the program and delete the `data/` folder.
+`data/attendance.sqlite3` stores the roster and attendance history. Face crops and trained embeddings stay in `data/`; these files are not encrypted. Restrict access to the computer account and folder. **Remove** deletes a student's face crops and attendance history. To erase all app data, close the program and delete `data/`.
 
 Obtain appropriate student/guardian consent and follow school policy and local law before collecting biometric data. Provide non-biometric attendance as an alternative. This prototype has no user accounts, encrypted database, audit trail, liveness detection, or demographic performance evaluation; do not use it as the sole attendance record or for disciplinary decisions.

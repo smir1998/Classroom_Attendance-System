@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import shutil
 import sqlite3
 import tkinter as tk
+import zipfile
 from datetime import date, datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -19,6 +21,7 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 DATASET_DIR = DATA_DIR / "dataset"
 DB_PATH = DATA_DIR / "attendance.sqlite3"
+PROFILE_PATH = DATA_DIR / "student_profiles.npz"
 MODEL_DIR = APP_DIR / "models"
 DETECTOR_PATH = MODEL_DIR / "face_detection_yunet_2023mar.onnx"
 EMBEDDING_PATH = MODEL_DIR / "face_recognition_sface_2021dec.onnx"
@@ -26,6 +29,7 @@ CAMERA_INDEX = 0
 FACE_SIZE = (112, 112)
 SAMPLES_PER_ENROLLMENT = 24
 MATCH_THRESHOLD = 0.363  # Cosine similarity; tune with the local student dataset.
+MAX_PROTOTYPES_PER_STUDENT = 3
 
 BG = "#f3f6fa"
 INK = "#152238"
@@ -164,7 +168,9 @@ class AttendanceApp:
         self.students_by_id: dict[int, sqlite3.Row] = {}
         self.detector = None
         self.recognizer = None
-        self.prototypes: dict[int, np.ndarray] = {}
+        self.prototypes: dict[int, list[np.ndarray]] = {}
+        self.training_report = ""
+        self.match_threshold = MATCH_THRESHOLD
         self.camera: cv2.VideoCapture | None = None
         self.running = False
         self.enrolling: tuple[str, str] | None = None
@@ -219,7 +225,7 @@ class AttendanceApp:
         cards.pack(fill="x", pady=(0, 16))
         self.enrolled_value = self._stat_card(cards, "ENROLLED", "0", "Students in this class")
         self.present_value = self._stat_card(cards, "PRESENT TODAY", "0", "Unique students checked in")
-        self.model_value = self._stat_card(cards, "FACE MODEL", "Not trained", "Train after adding dataset images")
+        self.model_value = self._stat_card(cards, "FACE MODEL", "Not trained", "Quality checks · augmentation · validation")
 
         self.tabs = ttk.Notebook(shell)
         self.tabs.pack(fill="both", expand=True)
@@ -302,6 +308,7 @@ class AttendanceApp:
         head.pack(fill="x", pady=(0, 10))
         tk.Label(head, text="Class roster", bg=BG, fg=INK, font=("Segoe UI", 16, "bold")).pack(side="left")
         self._button(head, "Train embeddings", self._train_model, primary=True).pack(side="right")
+        self._button(head, "Training report", self._show_training_report).pack(side="right", padx=(0, 8))
         self._button(head, "Add student", self._begin_enrollment).pack(side="right", padx=(0, 8))
         self._button(head, "Import photos", self._import_student_photos).pack(side="right", padx=(0, 8))
         self._button(head, "Mark present", self._mark_selected_present).pack(side="right", padx=(0, 8))
@@ -357,41 +364,258 @@ class AttendanceApp:
         self.enrolled_value.configure(text=str(len(students)))
         self.present_value.configure(text=str(count))
 
-    def _load_dataset(self, silent: bool = False) -> None:
+    @staticmethod
+    def _normalise(vector: np.ndarray) -> np.ndarray:
+        vector = vector.astype(np.float32, copy=False)
+        return vector / max(float(np.linalg.norm(vector)), 1e-12)
+
+    def _dataset_signature(self) -> str:
+        digest = hashlib.sha256()
+        if DATASET_DIR.exists():
+            for image_path in sorted(DATASET_DIR.rglob("*.jpg")):
+                digest.update(str(image_path.relative_to(DATASET_DIR)).encode())
+                with image_path.open("rb") as image_file:
+                    while chunk := image_file.read(1024 * 1024):
+                        digest.update(chunk)
+        return digest.hexdigest()
+
+    def _load_profile_cache(self, signature: str) -> bool:
+        if not PROFILE_PATH.exists():
+            return False
+        try:
+            with np.load(PROFILE_PATH, allow_pickle=False) as saved:
+                if str(saved["signature"].item()) != signature:
+                    return False
+                labels = saved["labels"].astype(np.int64)
+                vectors = saved["vectors"].astype(np.float32)
+                if vectors.ndim != 2 or vectors.shape[1] != 128 or len(labels) != len(vectors):
+                    return False
+                current_ids = set(self.students_by_id)
+                if not set(labels.tolist()).issubset(current_ids):
+                    return False
+                self.prototypes = {}
+                for student_id, vector in zip(labels, vectors):
+                    self.prototypes.setdefault(int(student_id), []).append(self._normalise(vector))
+                self.match_threshold = float(saved["threshold"].item())
+                self.training_report = str(saved["report"].item())
+                return bool(self.prototypes)
+        except (OSError, KeyError, ValueError, EOFError, zipfile.BadZipFile):
+            return False
+
+    def _save_profile_cache(self, signature: str) -> None:
+        labels, vectors = [], []
+        for student_id, centers in self.prototypes.items():
+            for center in centers:
+                labels.append(student_id)
+                vectors.append(center)
+        if not vectors:
+            return
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            np.savez_compressed(
+                PROFILE_PATH,
+                labels=np.asarray(labels, dtype=np.int64),
+                vectors=np.vstack(vectors).astype(np.float32),
+                threshold=np.asarray(self.match_threshold, dtype=np.float32),
+                signature=np.asarray(signature),
+                report=np.asarray(self.training_report),
+            )
+        except OSError:
+            self.session_status.configure(text="Profiles trained; local cache could not be saved.")
+
+    def _invalidate_profiles(self) -> None:
+        self.prototypes = {}
+        self.training_report = ""
+        self.match_threshold = MATCH_THRESHOLD
+        self.model_value.configure(text="Retrain required", fg=RED)
+        PROFILE_PATH.unlink(missing_ok=True)
+
+    def _embedding(self, image: np.ndarray) -> np.ndarray:
+        feature = self.recognizer.feature(image).flatten().astype(np.float32)
+        return self._normalise(feature)
+
+    def _augment(self, image: np.ndarray) -> list[np.ndarray]:
+        return [
+            image,
+            cv2.flip(image, 1),
+            cv2.convertScaleAbs(image, alpha=0.92, beta=8),
+            cv2.convertScaleAbs(image, alpha=1.06, beta=-6),
+        ]
+
+    def _student_prototypes(self, vectors: list[np.ndarray]) -> list[np.ndarray]:
+        matrix = np.vstack(vectors).astype(np.float32)
+        matrix /= np.maximum(np.linalg.norm(matrix, axis=1, keepdims=True), 1e-12)
+        similarities = matrix @ matrix.T
+        k = min(MAX_PROTOTYPES_PER_STUDENT, max(1, int(np.ceil(np.sqrt(len(matrix) / 8)))))
+        centers = [int(np.argmax(similarities.mean(axis=1)))]
+        while len(centers) < k:
+            nearest = similarities[:, centers].max(axis=1)
+            candidate = int(np.argmin(nearest))
+            if nearest[candidate] > 0.985:
+                break
+            centers.append(candidate)
+        center_vectors = matrix[centers].copy()
+        for _ in range(6):
+            assignments = np.argmax(matrix @ center_vectors.T, axis=1)
+            updated = []
+            for cluster_index, prior in enumerate(center_vectors):
+                members = matrix[assignments == cluster_index]
+                updated.append(self._normalise(members.mean(axis=0)) if len(members) else prior)
+            center_vectors = np.vstack(updated)
+        return [self._normalise(center) for center in center_vectors]
+
+    def _validate_embeddings(
+        self, originals: dict[int, list[np.ndarray]]
+    ) -> tuple[float, float | None, float | None, int, int]:
+        genuine_scores: list[float] = []
+        impostor_scores: list[float] = []
+        for student_id, samples in originals.items():
+            if len(samples) < 2:
+                continue
+            for held_out_index, held_out in enumerate(samples):
+                references = samples[:held_out_index] + samples[held_out_index + 1 :]
+                genuine_center = self._normalise(np.mean(references, axis=0))
+                genuine_scores.append(float(np.dot(held_out, genuine_center)))
+                for other_id, other_samples in originals.items():
+                    if other_id == student_id:
+                        continue
+                    other_center = self._normalise(np.mean(other_samples, axis=0))
+                    impostor_scores.append(float(np.dot(held_out, other_center)))
+        if len(impostor_scores) < 50:
+            return MATCH_THRESHOLD, None, None, len(genuine_scores), len(impostor_scores)
+        candidates = np.arange(0.20, 0.901, 0.005)
+        feasible = [
+            float(threshold) for threshold in candidates
+            if np.mean(np.asarray(impostor_scores) >= threshold) <= 0.01
+        ]
+        threshold = min(feasible) if feasible else 0.90
+        false_accept = float(np.mean(np.asarray(impostor_scores) >= threshold))
+        false_reject = float(np.mean(np.asarray(genuine_scores) < threshold)) if genuine_scores else None
+        return threshold, false_accept, false_reject, len(genuine_scores), len(impostor_scores)
+
+    def _load_dataset(self, silent: bool = False, force: bool = False) -> None:
         if self.recognizer is None:
             self.prototypes = {}
             return
-        prototypes: dict[int, list[np.ndarray]] = {}
-        for student_dir in DATASET_DIR.iterdir() if DATASET_DIR.exists() else []:
-            if not student_dir.is_dir() or not student_dir.name.isdigit():
+        signature = self._dataset_signature()
+        if not force and self._load_profile_cache(signature):
+            self.model_value.configure(text=f"Ready · {len(self.prototypes)} students", fg=GREEN)
+            if not silent:
+                self.session_status.configure(text="Loaded the trained student profiles from local cache.")
+            return
+        if force:
+            PROFILE_PATH.unlink(missing_ok=True)
+
+        originals: dict[int, list[np.ndarray]] = {}
+        augmented: dict[int, list[np.ndarray]] = {}
+        total_images = accepted_images = quality_rejected = outlier_rejected = 0
+        image_paths = sorted(DATASET_DIR.rglob("*.jpg")) if DATASET_DIR.exists() else []
+        total_paths = len(image_paths)
+        for sample_number, image_path in enumerate(image_paths, start=1):
+            student_dir = image_path.parent
+            if not student_dir.name.isdigit():
                 continue
-            for image_path in sorted(student_dir.glob("*.jpg")):
-                image = cv2.imread(str(image_path))
-                if image is None:
+            student_id = int(student_dir.name)
+            if student_id not in self.students_by_id:
+                continue
+            total_images += 1
+            if not silent:
+                self.session_status.configure(text=f"Training embeddings · sample {sample_number} of {total_paths}…")
+                self.root.update_idletasks()
+            image = cv2.imread(str(image_path))
+            if image is None:
+                quality_rejected += 1
+                continue
+            try:
+                faces = self._detect(image)
+                if len(faces) > 1:
+                    quality_rejected += 1
                     continue
-                try:
-                    faces = self._detect(image)
-                    aligned = self.recognizer.alignCrop(image, faces[0]) if len(faces) == 1 else image
-                    feature = self.recognizer.feature(cv2.resize(aligned, FACE_SIZE)).flatten().astype(np.float32)
-                    feature /= max(float(np.linalg.norm(feature)), 1e-12)
-                    prototypes.setdefault(int(student_dir.name), []).append(feature)
-                except cv2.error:
+                aligned = self.recognizer.alignCrop(image, faces[0]) if len(faces) == 1 else image
+                aligned = cv2.resize(aligned, FACE_SIZE)
+                gray = cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY)
+                sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+                brightness = float(gray.mean())
+                if sharpness < 4.0 or brightness < 12.0 or brightness > 245.0:
+                    quality_rejected += 1
                     continue
-        self.prototypes = {}
-        for student_id, vectors in prototypes.items():
-            average = np.mean(vectors, axis=0)
-            average /= max(float(np.linalg.norm(average)), 1e-12)
-            self.prototypes[student_id] = average
+                variants = [self._embedding(item) for item in self._augment(aligned)]
+                originals.setdefault(student_id, []).append(variants[0])
+                augmented.setdefault(student_id, []).append(variants)
+            except cv2.error:
+                quality_rejected += 1
+
+        accepted_originals: dict[int, list[np.ndarray]] = {}
+        accepted_augmented: dict[int, list[np.ndarray]] = {}
+        for student_id, original_vectors in originals.items():
+            matrix = np.vstack(original_vectors)
+            if len(matrix) >= 5:
+                similarity = matrix @ matrix.T
+                medoid_index = int(np.argmax(similarity.mean(axis=1)))
+                to_medoid = similarity[:, medoid_index]
+                median = float(np.median(to_medoid))
+                mad = float(np.median(np.abs(to_medoid - median)))
+                cutoff = median - max(0.08, 3.0 * mad)
+                keep = np.flatnonzero(to_medoid >= cutoff)
+                minimum_keep = max(3, int(np.ceil(len(matrix) * 0.60)))
+                if len(keep) < minimum_keep:
+                    keep = np.argsort(to_medoid)[-minimum_keep:]
+                outlier_rejected += len(matrix) - len(keep)
+            else:
+                keep = np.arange(len(matrix))
+            accepted = [int(index) for index in keep]
+            accepted_originals[student_id] = [original_vectors[index] for index in accepted]
+            accepted_augmented[student_id] = [vector for index in accepted for vector in augmented[student_id][index]]
+            accepted_images += len(accepted)
+
+        self.prototypes = {
+            student_id: self._student_prototypes(vectors)
+            for student_id, vectors in accepted_augmented.items() if vectors
+        }
+        self.match_threshold, far, frr, genuine_count, impostor_count = self._validate_embeddings(accepted_originals)
+        self.training_report = (
+            "Advanced embedding training report\n\n"
+            f"Dataset images found: {total_images}\n"
+            f"Quality filtered: {quality_rejected}\n"
+            f"Outliers filtered: {outlier_rejected}\n"
+            f"Images used: {accepted_images}\n"
+            f"Students profiled: {len(self.prototypes)}\n"
+            "Augmentations: horizontal flip and mild lighting variation\n"
+            f"Identity prototypes: {sum(len(items) for items in self.prototypes.values())}\n"
+        )
+        if far is None:
+            self.training_report += (
+                "Validation: insufficient impostor comparisons for safe threshold calibration; "
+                f"using configured threshold {self.match_threshold:.3f}.\n"
+            )
+        else:
+            self.training_report += (
+                f"Leave-one-out validation: {genuine_count} genuine and {impostor_count} impostor comparisons\n"
+                f"Calibrated threshold: {self.match_threshold:.3f} (empirical false-accept rate {far:.1%}; "
+                f"false-reject rate {frr:.1%})\n"
+            )
+        self.training_report += (
+            "SFace's pretrained weights stay frozen; training adapts student identity profiles.\n"
+            "Validation uses this enrolled dataset and is an estimate, not a guarantee of real-world accuracy."
+        )
+
         if self.prototypes:
             self.model_value.configure(text=f"Ready · {len(self.prototypes)} students", fg=GREEN)
+            self._save_profile_cache(signature)
         else:
-            self.model_value.configure(text="Not trained", fg=INK)
+            self.model_value.configure(text="No usable faces", fg=RED)
         if not silent:
             if not self.prototypes:
-                messagebox.showinfo("No face images", "Enroll a student or import face photos first.")
+                messagebox.showinfo("No usable face images", "Add clear face photos for students, then train again.")
             else:
-                image_count = sum(len(v) for v in prototypes.values())
-                self.session_status.configure(text=f"Built {len(self.prototypes)} student embeddings from {image_count} images.")
+                self.session_status.configure(text="Training complete. Review the validation report before attendance.")
+                messagebox.showinfo("Training complete", self.training_report)
+
+    def _show_training_report(self) -> None:
+        if self.training_report:
+            messagebox.showinfo("Student embedding training", self.training_report)
+        else:
+            messagebox.showinfo("No training report", "Select Train embeddings to build and evaluate student profiles.")
 
     def _train_model(self) -> None:
         if self.running:
@@ -400,7 +624,7 @@ class AttendanceApp:
         if self.detector is None or self.recognizer is None:
             messagebox.showerror("Face models missing", "Run python download_models.py, then restart the app.")
             return
-        self._load_dataset(silent=False)
+        self._load_dataset(silent=False, force=True)
 
     def _begin_enrollment(self) -> None:
         if self.running:
@@ -502,11 +726,11 @@ class AttendanceApp:
         except cv2.error:
             return None, 0.0, "Unknown"
         best_id, best_score = None, -1.0
-        for student_id, prototype in self.prototypes.items():
-            score = float(np.dot(feature, prototype))
+        for student_id, identity_prototypes in self.prototypes.items():
+            score = max(float(np.dot(feature, prototype)) for prototype in identity_prototypes)
             if score > best_score:
                 best_id, best_score = student_id, score
-        if best_id is None or best_score < MATCH_THRESHOLD:
+        if best_id is None or best_score < self.match_threshold:
             return None, max(best_score, 0.0), "Unknown"
         row = self.students_by_id.get(best_id)
         return (best_id, best_score, row["name"]) if row else (None, best_score, "Unknown")
@@ -597,8 +821,7 @@ class AttendanceApp:
             number, name = self.enrolling
             try:
                 self.store.add_student(number, name, self.enrollment_faces)
-                self.prototypes = {}
-                self.model_value.configure(text="Retrain required", fg=RED)
+                self._invalidate_profiles()
                 self.session_status.configure(
                     text=f"Captured {len(self.enrollment_faces)} face crops for {name}. Select Train embeddings."
                 )
@@ -698,8 +921,7 @@ class AttendanceApp:
         if crops:
             try:
                 self.store.add_dataset_images(student_id, crops)
-                self.prototypes = {}
-                self.model_value.configure(text="Retrain required", fg=RED)
+                self._invalidate_profiles()
             except OSError as error:
                 messagebox.showerror("Could not save dataset", str(error))
                 return
@@ -732,8 +954,7 @@ class AttendanceApp:
             return
         student_id = int(student["id"])
         self.store.remove_student(student_id)
-        self.prototypes = {}
-        self.model_value.configure(text="Retrain required", fg=RED)
+        self._invalidate_profiles()
         self.today_present_ids.discard(student_id)
         self._refresh_roster()
         self.session_status.configure(text=f"Removed {student['name']} and their local face dataset.")
