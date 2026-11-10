@@ -723,8 +723,18 @@ class AttendanceApp:
         if self.detector is None or self.recognizer is None:
             messagebox.showerror("Face models missing", "Run python download_models.py before fine-tuning.")
             return
-        if not DATASET_DIR.exists() or not any(DATASET_DIR.rglob("*.jpg")):
-            messagebox.showinfo("Dataset is empty", "Capture or import student face images before fine-tuning.")
+        student_counts = [
+            len(list(student_dir.glob("*.jpg")))
+            for student_dir in sorted(DATASET_DIR.iterdir(), key=lambda path: path.name)
+            if student_dir.is_dir() and student_dir.name.isdigit()
+        ] if DATASET_DIR.exists() else []
+        if len(student_counts) < 2 or any(count < 4 for count in student_counts):
+            counts = ", ".join(str(count) for count in student_counts) or "none"
+            messagebox.showinfo(
+                "More labeled student images needed",
+                "Fine-tuning needs at least 2 students with at least 4 face images each. "
+                f"Current image counts per student: {counts}. Add another student's photos, then retry.",
+            )
             return
         if importlib.util.find_spec("torch") is None or importlib.util.find_spec("facenet_pytorch") is None:
             messagebox.showerror(
