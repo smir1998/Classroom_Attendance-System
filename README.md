@@ -33,7 +33,19 @@ A local desktop attendance prototype for webcam sessions and group photographs. 
 4. Choose **Train embeddings**. The app runs quality checks, applies horizontal-flip and mild lighting augmentation, removes embedding outliers, and builds up to three pose/appearance prototypes per student. It validates profiles with leave-one-out comparisons and, when there are enough impostor comparisons, calibrates the threshold toward an empirical false-accept rate of at most 1%. The training report shows the observed rates and fallback when the dataset cannot meet that target.
 5. Open **Training report** to review how many images were used or filtered and the validation scores. The trained profiles are cached locally in `data/student_profiles.npz`; the app reuses the cache when the dataset is unchanged and retrains after dataset changes.
 
-SFace's pretrained neural network is not fine-tuned. Student-specific profiles are learned from its embeddings, a more practical approach for classroom-sized datasets. The validation figures are estimates from the enrolled images and do not guarantee performance on future photos; collect separate evaluation images for a reliable deployment assessment.
+### Fine-tune the neural network weights
+
+Fine-tuning is optional and needs more disk space and compute than normal attendance. Install the additional PyTorch/FaceNet packages:
+
+```powershell
+python -m pip install -r finetune-requirements.txt
+```
+
+For an NVIDIA GPU, install the matching CUDA-enabled PyTorch build using the [official PyTorch selector](https://pytorch.org/get-started/locally/) before installing `finetune-requirements.txt`. The first run downloads the pretrained VGGFace2 FaceNet weights from [facenet-pytorch](https://github.com/timesler/facenet-pytorch) into the PyTorch cache.
+
+In **Students & face dataset**, choose **Fine-tune weights**. The trainer requires at least two students and four images per student. It makes a per-student holdout split (keeping the last captured images for validation to reduce adjacent-frame leakage), uses balanced batches and lighting/flip augmentation, then fine-tunes the final residual blocks and projection layer with early stopping. It saves `data/finetuned_facenet.pt`; the app then rebuilds student profiles with those weights and uses FaceNet embeddings for future attendance scans. On later launches the saved weights load automatically when the optional packages are installed.
+
+The fine-tuned network is initialized from pretrained FaceNet VGGFace2 weights; it is not trained from scratch. Small student datasets can overfit, so review the held-out validation accuracy, capture varied images, and evaluate on separate photos before relying on attendance results. The UI's **Train embeddings** action remains available to rebuild student profiles without changing network weights.
 
 ## Take attendance
 

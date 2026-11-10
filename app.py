@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import importlib.util
+import json
 import shutil
 import sqlite3
+import subprocess
+import sys
 import tkinter as tk
 import zipfile
 from datetime import date, datetime
@@ -22,6 +26,9 @@ DATA_DIR = APP_DIR / "data"
 DATASET_DIR = DATA_DIR / "dataset"
 DB_PATH = DATA_DIR / "attendance.sqlite3"
 PROFILE_PATH = DATA_DIR / "student_profiles.npz"
+FINETUNED_WEIGHTS_PATH = DATA_DIR / "finetuned_facenet.pt"
+FINETUNE_REPORT_PATH = DATA_DIR / "finetune_report.json"
+FINETUNE_LOG_PATH = DATA_DIR / "finetune.log"
 MODEL_DIR = APP_DIR / "models"
 DETECTOR_PATH = MODEL_DIR / "face_detection_yunet_2023mar.onnx"
 EMBEDDING_PATH = MODEL_DIR / "face_recognition_sface_2021dec.onnx"
@@ -29,6 +36,7 @@ CAMERA_INDEX = 0
 FACE_SIZE = (112, 112)
 SAMPLES_PER_ENROLLMENT = 24
 MATCH_THRESHOLD = 0.363  # Cosine similarity; tune with the local student dataset.
+FACENET_MATCH_THRESHOLD = 0.70
 MAX_PROTOTYPES_PER_STUDENT = 3
 
 BG = "#f3f6fa"
@@ -168,6 +176,13 @@ class AttendanceApp:
         self.students_by_id: dict[int, sqlite3.Row] = {}
         self.detector = None
         self.recognizer = None
+        self.torch = None
+        self.finetuned_model = None
+        self.finetuned_device = None
+        self.embedding_backend = "sface"
+        self.finetune_process = None
+        self.finetune_log_file = None
+        self.dataset_locked = False
         self.prototypes: dict[int, list[np.ndarray]] = {}
         self.training_report = ""
         self.match_threshold = MATCH_THRESHOLD
@@ -187,6 +202,7 @@ class AttendanceApp:
         self.root.configure(bg=BG)
         self._build_ui()
         self._load_engines()
+        self._load_finetuned_weights()
         self._refresh_roster()
         self._load_dataset(silent=True)
         self.root.protocol("WM_DELETE_WINDOW", self._close)
@@ -225,7 +241,7 @@ class AttendanceApp:
         cards.pack(fill="x", pady=(0, 16))
         self.enrolled_value = self._stat_card(cards, "ENROLLED", "0", "Students in this class")
         self.present_value = self._stat_card(cards, "PRESENT TODAY", "0", "Unique students checked in")
-        self.model_value = self._stat_card(cards, "FACE MODEL", "Not trained", "Quality checks · augmentation · validation")
+        self.model_value = self._stat_card(cards, "FACE MODEL", "Not trained", "Fine-tune FaceNet or use SFace profiles")
 
         self.tabs = ttk.Notebook(shell)
         self.tabs.pack(fill="both", expand=True)
@@ -308,6 +324,8 @@ class AttendanceApp:
         head.pack(fill="x", pady=(0, 10))
         tk.Label(head, text="Class roster", bg=BG, fg=INK, font=("Segoe UI", 16, "bold")).pack(side="left")
         self._button(head, "Train embeddings", self._train_model, primary=True).pack(side="right")
+        self.finetune_button = self._button(head, "Fine-tune weights", self._start_finetuning)
+        self.finetune_button.pack(side="right", padx=(0, 8))
         self._button(head, "Training report", self._show_training_report).pack(side="right", padx=(0, 8))
         self._button(head, "Add student", self._begin_enrollment).pack(side="right", padx=(0, 8))
         self._button(head, "Import photos", self._import_student_photos).pack(side="right", padx=(0, 8))
@@ -344,6 +362,40 @@ class AttendanceApp:
             self.session_status.configure(text=f"Could not load face models: {error}")
             self.model_value.configure(text="Model error", fg=RED)
 
+    def _load_finetuned_weights(self) -> bool:
+        if self.recognizer is None or not FINETUNED_WEIGHTS_PATH.exists():
+            return False
+        try:
+            import torch
+            from facenet_pytorch import InceptionResnetV1
+
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            model = InceptionResnetV1(pretrained=None, classify=False).to(device)
+            try:
+                state = torch.load(FINETUNED_WEIGHTS_PATH, map_location=device, weights_only=True)
+            except TypeError:  # Compatibility with older PyTorch releases.
+                state = torch.load(FINETUNED_WEIGHTS_PATH, map_location=device)
+            model.load_state_dict(state, strict=True)
+            model.eval()
+            self.torch = torch
+            self.finetuned_model = model
+            self.finetuned_device = device
+            self.embedding_backend = "finetuned-facenet"
+            self.match_threshold = FACENET_MATCH_THRESHOLD
+            return True
+        except ImportError:
+            self.session_status.configure(
+                text="Fine-tuned weights found; install finetune-requirements.txt to load them. Using SFace for now."
+            )
+        except Exception as error:
+            self.session_status.configure(text=f"Could not load fine-tuned weights: {error}. Using SFace for now.")
+        self.embedding_backend = "sface"
+        self.match_threshold = MATCH_THRESHOLD
+        self.torch = None
+        self.finetuned_model = None
+        self.finetuned_device = None
+        return False
+
     def _refresh_roster(self) -> None:
         if not hasattr(self, "roster"):
             return
@@ -371,6 +423,10 @@ class AttendanceApp:
 
     def _dataset_signature(self) -> str:
         digest = hashlib.sha256()
+        digest.update(self.embedding_backend.encode())
+        if FINETUNED_WEIGHTS_PATH.exists() and self.embedding_backend == "finetuned-facenet":
+            stat = FINETUNED_WEIGHTS_PATH.stat()
+            digest.update(f"{stat.st_size}:{stat.st_mtime_ns}".encode())
         if DATASET_DIR.exists():
             for image_path in sorted(DATASET_DIR.rglob("*.jpg")):
                 digest.update(str(image_path.relative_to(DATASET_DIR)).encode())
@@ -388,7 +444,8 @@ class AttendanceApp:
                     return False
                 labels = saved["labels"].astype(np.int64)
                 vectors = saved["vectors"].astype(np.float32)
-                if vectors.ndim != 2 or vectors.shape[1] != 128 or len(labels) != len(vectors):
+                expected_width = 512 if self.finetuned_model is not None else 128
+                if vectors.ndim != 2 or vectors.shape[1] != expected_width or len(labels) != len(vectors):
                     return False
                 current_ids = set(self.students_by_id)
                 if not set(labels.tolist()).issubset(current_ids):
@@ -426,11 +483,22 @@ class AttendanceApp:
     def _invalidate_profiles(self) -> None:
         self.prototypes = {}
         self.training_report = ""
-        self.match_threshold = MATCH_THRESHOLD
+        self.match_threshold = self._base_match_threshold()
         self.model_value.configure(text="Retrain required", fg=RED)
         PROFILE_PATH.unlink(missing_ok=True)
 
+    def _base_match_threshold(self) -> float:
+        return FACENET_MATCH_THRESHOLD if self.finetuned_model is not None else MATCH_THRESHOLD
+
     def _embedding(self, image: np.ndarray) -> np.ndarray:
+        if self.finetuned_model is not None:
+            rgb = cv2.cvtColor(cv2.resize(image, (160, 160)), cv2.COLOR_BGR2RGB)
+            tensor = self.torch.from_numpy(rgb.copy()).permute(2, 0, 1).float()
+            tensor = (tensor - 127.5) / 128.0
+            tensor = tensor.unsqueeze(0).to(self.finetuned_device)
+            with self.torch.inference_mode():
+                feature = self.finetuned_model(tensor).squeeze(0).cpu().numpy()
+            return self._normalise(feature)
         feature = self.recognizer.feature(image).flatten().astype(np.float32)
         return self._normalise(feature)
 
@@ -482,7 +550,7 @@ class AttendanceApp:
                     other_center = self._normalise(np.mean(other_samples, axis=0))
                     impostor_scores.append(float(np.dot(held_out, other_center)))
         if len(impostor_scores) < 50:
-            return MATCH_THRESHOLD, None, None, len(genuine_scores), len(impostor_scores)
+            return self._base_match_threshold(), None, None, len(genuine_scores), len(impostor_scores)
         candidates = np.arange(0.20, 0.901, 0.005)
         feasible = [
             float(threshold) for threshold in candidates
@@ -499,7 +567,10 @@ class AttendanceApp:
             return
         signature = self._dataset_signature()
         if not force and self._load_profile_cache(signature):
-            self.model_value.configure(text=f"Ready · {len(self.prototypes)} students", fg=GREEN)
+            self.model_value.configure(
+                text=f"{ 'FaceNet' if self.finetuned_model is not None else 'SFace' } · {len(self.prototypes)} students",
+                fg=GREEN,
+            )
             if not silent:
                 self.session_status.configure(text="Loaded the trained student profiles from local cache.")
             return
@@ -575,6 +646,7 @@ class AttendanceApp:
         self.match_threshold, far, frr, genuine_count, impostor_count = self._validate_embeddings(accepted_originals)
         self.training_report = (
             "Advanced embedding training report\n\n"
+            f"Embedding network: {'fine-tuned FaceNet' if self.finetuned_model is not None else 'pretrained SFace'}\n"
             f"Dataset images found: {total_images}\n"
             f"Quality filtered: {quality_rejected}\n"
             f"Outliers filtered: {outlier_rejected}\n"
@@ -600,7 +672,10 @@ class AttendanceApp:
         )
 
         if self.prototypes:
-            self.model_value.configure(text=f"Ready · {len(self.prototypes)} students", fg=GREEN)
+            self.model_value.configure(
+                text=f"{ 'FaceNet' if self.finetuned_model is not None else 'SFace' } · {len(self.prototypes)} students",
+                fg=GREEN,
+            )
             self._save_profile_cache(signature)
         else:
             self.model_value.configure(text="No usable faces", fg=RED)
@@ -613,11 +688,26 @@ class AttendanceApp:
 
     def _show_training_report(self) -> None:
         if self.training_report:
-            messagebox.showinfo("Student embedding training", self.training_report)
+            report = self.training_report
+            if FINETUNE_REPORT_PATH.exists():
+                try:
+                    fine_tune = json.loads(FINETUNE_REPORT_PATH.read_text(encoding="utf-8"))
+                    report += (
+                        "\n\nFine-tuned network validation\n"
+                        f"Held-out accuracy: {fine_tune['validation_accuracy']:.1%}\n"
+                        f"Held-out images: {fine_tune['validation_images']}\n"
+                        f"Fine-tuned layers: {', '.join(fine_tune['fine_tuned_layers'])}"
+                    )
+                except (OSError, KeyError, ValueError, json.JSONDecodeError):
+                    pass
+            messagebox.showinfo("Student embedding training", report)
         else:
             messagebox.showinfo("No training report", "Select Train embeddings to build and evaluate student profiles.")
 
     def _train_model(self) -> None:
+        if self.dataset_locked:
+            messagebox.showinfo("Fine-tuning in progress", "Wait for network fine-tuning to finish before rebuilding profiles.")
+            return
         if self.running:
             messagebox.showinfo("Stop camera first", "Stop the live session before rebuilding embeddings.")
             return
@@ -626,7 +716,104 @@ class AttendanceApp:
             return
         self._load_dataset(silent=False, force=True)
 
+    def _start_finetuning(self) -> None:
+        if self.running:
+            messagebox.showinfo("Stop camera first", "Stop the live session before fine-tuning network weights.")
+            return
+        if self.detector is None or self.recognizer is None:
+            messagebox.showerror("Face models missing", "Run python download_models.py before fine-tuning.")
+            return
+        if not DATASET_DIR.exists() or not any(DATASET_DIR.rglob("*.jpg")):
+            messagebox.showinfo("Dataset is empty", "Capture or import student face images before fine-tuning.")
+            return
+        if importlib.util.find_spec("torch") is None or importlib.util.find_spec("facenet_pytorch") is None:
+            messagebox.showerror(
+                "Fine-tuning packages missing",
+                "Install the optional training packages first:\npython -m pip install -r finetune-requirements.txt",
+            )
+            return
+        script = APP_DIR / "finetune.py"
+        if not script.exists():
+            messagebox.showerror("Training script missing", "finetune.py is missing from the application folder.")
+            return
+        try:
+            FINETUNE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            self.finetune_log_file = FINETUNE_LOG_PATH.open("w", encoding="utf-8")
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            self.finetune_process = subprocess.Popen(
+                [sys.executable, str(script)],
+                cwd=APP_DIR,
+                stdout=self.finetune_log_file,
+                stderr=subprocess.STDOUT,
+                creationflags=flags,
+            )
+        except OSError as error:
+            if self.finetune_log_file:
+                self.finetune_log_file.close()
+                self.finetune_log_file = None
+            messagebox.showerror("Could not start fine-tuning", str(error))
+            return
+        self.finetune_button.configure(state="disabled")
+        self.camera_button.configure(state="disabled")
+        self.dataset_locked = True
+        self.session_status.configure(text="Fine-tuning the FaceNet backbone. This may take several minutes; the app remains open.")
+        self._poll_finetuning()
+
+    def _poll_finetuning(self) -> None:
+        if self.finetune_process is None:
+            return
+        exit_code = self.finetune_process.poll()
+        if exit_code is None:
+            try:
+                lines = FINETUNE_LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
+                if lines:
+                    self.session_status.configure(text=f"Fine-tuning · {lines[-1][:150]}")
+            except OSError:
+                pass
+            self.root.after(1500, self._poll_finetuning)
+            return
+        if self.finetune_log_file:
+            self.finetune_log_file.close()
+            self.finetune_log_file = None
+        self.finetune_process = None
+        self.dataset_locked = False
+        self.finetune_button.configure(state="normal")
+        self.camera_button.configure(state="normal")
+        if exit_code != 0 or not FINETUNED_WEIGHTS_PATH.exists():
+            try:
+                log = FINETUNE_LOG_PATH.read_text(encoding="utf-8", errors="replace")[-3000:]
+            except OSError:
+                log = "No training log is available."
+            messagebox.showerror("Fine-tuning failed", f"Check finetune.log for details.\n\n{log}")
+            return
+        if not self._load_finetuned_weights():
+            messagebox.showerror(
+                "Fine-tuned weights not loaded",
+                "Install the optional packages from finetune-requirements.txt, then restart the app.",
+            )
+            return
+        self._invalidate_profiles()
+        self._load_dataset(silent=True, force=True)
+        self._refresh_roster()
+        try:
+            report = json.loads(FINETUNE_REPORT_PATH.read_text(encoding="utf-8"))
+            summary = (
+                f"Fine-tuning complete on {report['device']}\n"
+                f"Students: {report['students']} · Train images: {report['train_images']} · "
+                f"Validation images: {report['validation_images']}\n"
+                f"Validation accuracy: {report['validation_accuracy']:.1%}\n"
+                f"Epochs: {report['epochs_completed']}\n\n"
+                "The app rebuilt the student embeddings using the fine-tuned weights."
+            )
+        except (OSError, KeyError, ValueError, json.JSONDecodeError):
+            summary = "Fine-tuning completed. The app rebuilt student profiles with the new weights."
+        self.session_status.configure(text="Fine-tuned FaceNet weights are active.")
+        messagebox.showinfo("Fine-tuning complete", summary)
+
     def _begin_enrollment(self) -> None:
+        if self.dataset_locked:
+            messagebox.showinfo("Fine-tuning in progress", "Wait for fine-tuning to finish before changing the dataset.")
+            return
         if self.running:
             messagebox.showinfo("Camera in use", "Stop the current camera session before enrolling a student.")
             return
@@ -881,6 +1068,9 @@ class AttendanceApp:
             self.preview_photo = None
 
     def _import_student_photos(self) -> None:
+        if self.dataset_locked:
+            messagebox.showinfo("Fine-tuning in progress", "Wait for fine-tuning to finish before changing the dataset.")
+            return
         if self.running:
             messagebox.showinfo("Stop camera first", "Stop the live session before importing face photos.")
             return
@@ -942,6 +1132,9 @@ class AttendanceApp:
         self.session_status.configure(text=f"Marked present manually: {student['name']} at {str(marked_at)[11:19]}.")
 
     def _remove_selected(self) -> None:
+        if self.dataset_locked:
+            messagebox.showinfo("Fine-tuning in progress", "Wait for fine-tuning to finish before changing the dataset.")
+            return
         if self.running:
             messagebox.showinfo("Stop camera first", "Stop the live session before removing a student.")
             return
